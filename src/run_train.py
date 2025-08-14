@@ -172,7 +172,7 @@ def evaluate_test_set_from_lists(image_paths, labels, model_path: str, char_to_i
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_dir', type=str, default='data/generated_dataset')
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_workers', type=int, default=0)  # Windows 안전값
     parser.add_argument('--learning_rate', type=float, default=3e-4)
     parser.add_argument('--num_epochs', type=int, default=10)
@@ -190,6 +190,17 @@ def main():
     parser.add_argument('--test_ratio', type=float, default=0.2)
     parser.add_argument('--shuffle_seed', type=int, default=42)
     parser.add_argument('--overfit_n', type=int, default=0)
+    # 타겟/제너럴 비율 제어(가중 샘플링)
+    parser.add_argument('--word_list_path', type=str, default='data/word_list.txt')
+    parser.add_argument('--target_start_line', type=int, default=293, help='word_list.txt에서 타겟 시작 라인(1-base)')
+    parser.add_argument('--target_end_line', type=int, default=302, help='word_list.txt에서 타겟 종료 라인(포함)')
+    parser.add_argument('--target_ratio', type=float, default=0.4, help='(가중 샘플링용, 유지) 배치 기대 타겟 비율')
+    # 고정 비율 두-스트림 배치 샘플러 옵션
+    parser.add_argument('--use_fixed_ratio_batch', action='store_true', help='두-스트림 고정 비율 배치 샘플러 사용')
+    parser.add_argument('--target_ratio_start', type=float, default=0.3, help='비율 커리큘럼 시작값')
+    parser.add_argument('--target_ratio_end', type=float, default=0.4, help='비율 커리큘럼 종료값')
+    parser.add_argument('--ratio_warmup_epochs', type=int, default=10, help='비율을 선형 증가시킬 에폭 수')
+    parser.add_argument('--target_repeat_max', type=int, default=6, help='한 에폭 내 타겟 샘플 최대 반복 횟수 R_max')
     args = parser.parse_args()
 
     csv_path = os.path.join(args.dataset_dir, 'labels.csv')
@@ -222,6 +233,30 @@ def main():
         tr_images, tr_labels = tr_images[:n], tr_labels[:n]
         val_images, val_labels = val_images[:min(n, len(val_images))], val_labels[:min(n, len(val_labels))]
 
+    # ===== 타겟 라벨 세트 구성 (word_list의 지정 라인 범위)
+    target_label_set = set()
+    try:
+        with open(args.word_list_path, 'r', encoding='utf-8') as f:
+            all_words = [line.strip() for line in f.readlines() if line.strip()]
+        s = max(1, int(args.target_start_line)) - 1
+        e = min(len(all_words), int(args.target_end_line))
+        for w in all_words[s:e]:
+            target_label_set.add(w)
+    except Exception:
+        target_label_set = set()
+
+    # ===== 가중 샘플링용 weight 벡터 계산 (train 전용)
+    # 목표: sum_t(wt) / (sum_t(wt) + sum_g(wg)) ~= target_ratio
+    t = sum(1 for lb in tr_labels if lb in target_label_set)
+    g = len(tr_labels) - t
+    if t > 0 and g > 0:
+        p = max(1e-3, min(1.0 - 1e-3, float(args.target_ratio)))
+        w_t = 1.0
+        w_g = (t * (1.0 - p)) / (g * p)
+        sampler_weights = [w_t if lb in target_label_set else max(1e-6, w_g) for lb in tr_labels]
+    else:
+        sampler_weights = None
+
     train_args = SimpleNamespace(
         train_image_paths=tr_images,
         train_labels=tr_labels,
@@ -238,6 +273,14 @@ def main():
         save_dir=args.save_dir,
         log_dir=args.log_dir,
         early_stopping_patience=args.early_stopping_patience,
+        sampler_weights=sampler_weights,
+        # 두-스트림용
+        use_fixed_ratio_batch=args.use_fixed_ratio_batch,
+        target_label_set=target_label_set,
+        target_ratio_start=args.target_ratio_start,
+        target_ratio_end=args.target_ratio_end,
+        ratio_warmup_epochs=args.ratio_warmup_epochs,
+        target_repeat_max=args.target_repeat_max,
     )
 
     os.makedirs(args.save_dir, exist_ok=True)

@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.nn import CTCLoss
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
@@ -89,10 +89,18 @@ def train(args):
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     train_dataset = HandwritingDataset(args.train_image_paths, args.train_labels, args.char_to_idx)
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, collate_fn=ctc_collate_fn
-    )
+    #배치 샘플링(가중치 기반, 타겟 비율 제어)
+    if getattr(args, 'sampler_weights', None):
+        sampler = WeightedRandomSampler(weights=torch.tensor(args.sampler_weights, dtype=torch.double), num_samples=len(train_dataset), replacement=True)
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, collate_fn=ctc_collate_fn, sampler=sampler
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, collate_fn=ctc_collate_fn
+        )
     val_dataset = HandwritingDataset(args.val_image_paths, args.val_labels, args.char_to_idx)
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
@@ -319,10 +327,91 @@ def train(args):
 
     # ===== Dataloaders =====
     train_dataset = HandwritingDataset(args.train_image_paths, args.train_labels, args.char_to_idx)
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, collate_fn=ctc_collate_fn
-    )
+
+    # --- 두-스트림 고정 비율 배치 샘플러 빌더 ---
+    def _build_fixed_ratio_loader(epoch: int):
+        import random as _rnd
+
+        # 비율 커리큘럼: 선형 증가
+        warm = int(getattr(args, 'ratio_warmup_epochs', 0) or 0)
+        r0 = float(getattr(args, 'target_ratio_start', 0.3))
+        r1 = float(getattr(args, 'target_ratio_end', 0.4))
+        if warm > 0:
+            alpha = min(1.0, max(0.0, epoch / float(warm)))
+            ratio = r0 + (r1 - r0) * alpha
+        else:
+            ratio = r1
+
+        B = int(args.batch_size)
+        B_t = max(1, int(round(B * ratio)))
+        B_g = max(1, B - B_t)
+
+        # 인덱스 분리
+        target_labels = set(getattr(args, 'target_label_set', set()) or set())
+        tgt_idx = [i for i, lb in enumerate(args.train_labels) if lb in target_labels]
+        gen_idx = [i for i, lb in enumerate(args.train_labels) if lb not in target_labels]
+        Nt, No = len(tgt_idx), len(gen_idx)
+
+        # 스텝 수: min( floor(No/B_g), floor(R_max * Nt / B_t) )
+        R_max = int(getattr(args, 'target_repeat_max', 6) or 6)
+        steps_by_g = No // max(1, B_g)
+        steps_by_t = (R_max * max(1, Nt)) // max(1, B_t)
+        steps = max(1, min(steps_by_g, steps_by_t))
+
+        rng = _rnd.Random(1234 + epoch)
+        batches = []
+        for _ in range(steps):
+            bt = [rng.choice(tgt_idx) for __ in range(B_t)] if Nt > 0 else []
+            bg = [rng.choice(gen_idx) for __ in range(B_g)] if No > 0 else []
+            batch = bt + bg
+            rng.shuffle(batch)       # 배치 내부 셔플
+            batches.append(batch)
+        rng.shuffle(batches)         # 배치 순서 셔플
+
+        class _FixedBatchSampler:
+            def __init__(self, batches):
+                self._batches = batches
+            def __iter__(self):
+                for b in self._batches:
+                    yield b
+            def __len__(self):
+                return len(self._batches)
+
+        sampler = _FixedBatchSampler(batches)
+        loader = DataLoader(
+            train_dataset,
+            batch_sampler=sampler,
+            num_workers=args.num_workers,
+            collate_fn=ctc_collate_fn,
+        )
+        return loader
+
+    # --- 학습 로더 설정: 고정 비율 > 가중 샘플링 > 기본 셔플 ---
+    if getattr(args, 'use_fixed_ratio_batch', False) and getattr(args, 'target_label_set', None):
+        train_loader = _build_fixed_ratio_loader(epoch=0)
+    elif getattr(args, 'sampler_weights', None):
+        # 에폭별 재현성 있는 샘플링을 원하면 gen에 시드 부여 가능
+        gen = torch.Generator()
+        gen.manual_seed(1234)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.tensor(args.sampler_weights, dtype=torch.double),
+            num_samples=len(train_dataset),
+            replacement=True,
+            generator=gen if 'generator' in torch.utils.data.WeightedRandomSampler.__init__.__code__.co_varnames else None,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=ctc_collate_fn,
+            sampler=sampler,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, collate_fn=ctc_collate_fn
+        )
     val_dataset = HandwritingDataset(args.val_image_paths, args.val_labels, args.char_to_idx)
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
@@ -375,6 +464,10 @@ def train(args):
     for epoch in range(start_epoch, args.num_epochs):
         model.train()
         total_loss = 0.0
+
+        # --- 에폭 시작 시 로더 재생성(비율 커리큘럼 적용) ---
+        if getattr(args, 'use_fixed_ratio_batch', False) and getattr(args, 'target_label_set', None):
+            train_loader = _build_fixed_ratio_loader(epoch)
 
         # --- Warmup LR ---
         if epoch < warmup_epochs:
