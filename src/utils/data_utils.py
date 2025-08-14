@@ -30,7 +30,8 @@ def encode_text(text, char_to_idx):
 def decode_prediction(pred, idx_to_char):
     """CTC 디코딩을 수행합니다."""
     # pred: [seq_length, batch_size, num_classes]
-    pred = pred.permute(1, 0, 2).cpu().numpy()  # [batch_size, seq_length, num_classes]
+    # 학습 중에도 사용되므로 detach() 후 CPU/NumPy로 변환
+    pred = pred.detach().permute(1, 0, 2).cpu().numpy()  # [batch_size, seq_length, num_classes]
     
     outputs = []
     for p in pred:
@@ -79,3 +80,36 @@ class HandwritingDataset(Dataset):
             'text': label
         }
 
+
+def ctc_collate_fn(batch):
+    """CTC 학습용 배치 결합 함수
+    - 이미지: 폭을 최대 폭에 맞춰 좌측 정렬 제로패딩 [B, 1, H, W_max]
+    - 라벨: 1D로 이어붙임
+    - 라벨 길이: 각 항목 길이 텐서
+    """
+    # 이미지 크기 수집
+    heights = [sample['image'].shape[-2] for sample in batch]
+    widths = [sample['image'].shape[-1] for sample in batch]
+    max_height = max(heights)
+    max_width = max(widths)
+
+    # 패딩된 이미지 텐서 준비
+    images = torch.zeros((len(batch), 1, max_height, max_width), dtype=torch.float32)
+    for i, sample in enumerate(batch):
+        img = sample['image']  # [1, H, W]
+        _, h, w = img.shape
+        images[i, :, :h, :w] = img
+
+    # 라벨 이어붙이기
+    labels_list = [sample['label'] for sample in batch]
+    labels = torch.cat(labels_list, dim=0)
+    label_lengths = torch.tensor([sample['label_length'] for sample in batch], dtype=torch.long)
+
+    texts = [sample['text'] for sample in batch]
+
+    return {
+        'image': images,
+        'label': labels,
+        'label_length': label_lengths,
+        'text': texts,
+    }

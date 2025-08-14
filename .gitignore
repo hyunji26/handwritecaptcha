@@ -7,6 +7,7 @@ models/*.bin
 # 대용량 생성물(원하면 제외)
 data/generated_dataset/images/
 data/generated_data/models/
+data/fonts/
 
 *.pt
 

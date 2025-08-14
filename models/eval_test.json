@@ -1,0 +1,7 @@
+{
+  "images": 428,
+  "cer": 0.0201765447667087,
+  "word_acc": 0.9626168224299065,
+  "latency_ms_per_image_avg": 4.1965586002742,
+  "latency_ms_per_image_p95": 4.461020231246948
+}
