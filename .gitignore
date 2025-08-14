@@ -1,0 +1,18 @@
+# 모델 가중치(포함하지 않음)
+models/*.pth
+models/*.pt
+models/*.onnx
+models/*.bin
+
+# 대용량 생성물(원하면 제외)
+data/generated_dataset/images/
+data/generated_data/models/
+
+*.pt
+
+*.pth
+
+checkpoints/
+
+runs/
+
