@@ -1,7 +1,8 @@
 {
-  "images": 428,
-  "cer": 0.0201765447667087,
-  "word_acc": 0.9626168224299065,
-  "latency_ms_per_image_avg": 4.1965586002742,
-  "latency_ms_per_image_p95": 4.461020231246948
+  "images": 3020,
+  "cer": 0.004142300194931774,
+  "word_acc": 0.9920529801324504,
+  "latency_ms_per_image_avg": 11.732979641844894,
+  "latency_ms_per_image_p95": 14.449737966060638,
+  "cnn_backbone": "basic"
 }

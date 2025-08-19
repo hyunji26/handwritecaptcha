@@ -1,3 +1,4 @@
+# run_train.py
 import os
 import csv
 import json
@@ -5,16 +6,20 @@ import argparse
 import random
 import time
 from types import SimpleNamespace
+from typing import Mapping, Sequence, Union
 
 import torch
 from torch.utils.data import DataLoader
 
-from src.train import train as train_fn
+from src.train import train as train_fn, compute_input_widths_from_padded_images
 from src.utils.data_utils import HandwritingDataset, ctc_collate_fn
 from src.model.crnn import CRNN
 from src.utils.metrics import character_error_rate
 
 
+# -------------------------
+# 데이터 로딩 & 전처 유틸
+# -------------------------
 def read_labels(csv_path: str, images_dir: str):
     image_paths = []
     labels = []
@@ -77,25 +82,38 @@ def split_train_val_test(image_paths, labels, train_ratio: float, val_ratio: flo
     test_images, test_labels = pick(test_idx)
     return tr_images, tr_labels, val_images, val_labels, test_images, test_labels
 
+
 def _word_accuracy(refs, hyps):
     ok = sum(1 for r, h in zip(refs, hyps) if r == h)
     return ok / max(1, len(refs))
 
 
+def _downsample_ratio_from_backbone(cnn_backbone: str) -> int:
+    return 4 if (cnn_backbone or "basic") == "basic" else 16
+
+
 @torch.no_grad()
-def _compute_input_widths_from_padded_images(padded_images: torch.Tensor) -> torch.Tensor:
-    col_sum = padded_images.sum(dim=2).sum(dim=1)
-    widths = (col_sum > 0).sum(dim=1).to(torch.long)
-    return widths
-
-
-def _compute_output_lengths_basic(input_widths: torch.Tensor) -> torch.Tensor:
-    t = input_widths // 4 - 1
+def _compute_output_lengths(input_widths: torch.Tensor, backbone: str) -> torch.Tensor:
+    ratio = _downsample_ratio_from_backbone(backbone)
+    if ratio == 4:
+        t = input_widths // 4 - 1
+    else:
+        t = input_widths // ratio
     return torch.clamp(t, min=1)
 
 
 @torch.no_grad()
-def _greedy_decode_with_lengths(outputs: torch.Tensor, idx_to_char, lengths: torch.Tensor):
+def _greedy_decode_with_lengths(
+    outputs: torch.Tensor,
+    idx_to_char: Union[Sequence[str], Mapping[int, str]],
+    lengths: torch.Tensor,
+):
+    # idx -> char 접근 함수
+    if isinstance(idx_to_char, Mapping):
+        def _itc(i): return idx_to_char.get(i, "")
+    else:
+        def _itc(i): return idx_to_char[i] if 0 <= i < len(idx_to_char) else ""
+
     probs = outputs.detach().permute(1, 0, 2).cpu()
     if torch.is_tensor(lengths):
         lengths = lengths.detach().cpu().tolist()
@@ -104,14 +122,14 @@ def _greedy_decode_with_lengths(outputs: torch.Tensor, idx_to_char, lengths: tor
         t_i = int(max(0, lengths[i])) if lengths is not None else p.shape[0]
         t_i = min(t_i, p.shape[0])
         seq = p[:t_i].argmax(dim=1).tolist()
-        out = []
-        prev = -1
+        out, prev = [], -1
         for c in seq:
             if c != prev and c != 0:
-                out.append(idx_to_char[c])
+                out.append(_itc(c))
             prev = c
         hyps.append(''.join(out))
     return hyps
+
 
 @torch.no_grad()
 def evaluate_test_set_from_lists(image_paths, labels, model_path: str, char_to_idx, idx_to_char, batch_size: int, num_workers: int):
@@ -119,8 +137,12 @@ def evaluate_test_set_from_lists(image_paths, labels, model_path: str, char_to_i
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=ctc_collate_fn)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = CRNN(num_channels=1, num_classes=len(char_to_idx) + 1).to(device)
     ck = torch.load(model_path, map_location=device)
+
+    # ✅ 백본을 ckpt에서 읽어 동일 구성으로 모델 생성
+    backbone = ck.get('cnn_backbone', 'basic')
+    model = CRNN(num_channels=1, num_classes=len(char_to_idx) + 1, cnn_backbone=backbone).to(device)
+
     state = ck['model_state_dict'] if isinstance(ck, dict) and 'model_state_dict' in ck else ck
     model.load_state_dict(state)
     model.eval()
@@ -137,8 +159,8 @@ def evaluate_test_set_from_lists(image_paths, labels, model_path: str, char_to_i
         outs = model(images)  # [T,B,C]
         t1 = time.time()
 
-        input_widths = _compute_input_widths_from_padded_images(batch['image'])
-        output_lengths = _compute_output_lengths_basic(input_widths)
+        input_widths = compute_input_widths_from_padded_images(batch['image'])
+        output_lengths = _compute_output_lengths(input_widths, backbone)
         hyps = _greedy_decode_with_lengths(outs, idx_to_char, output_lengths)
         refs = batch['text']
 
@@ -160,6 +182,7 @@ def evaluate_test_set_from_lists(image_paths, labels, model_path: str, char_to_i
         'word_acc': wacc,
         'latency_ms_per_image_avg': avg_ms,
         'latency_ms_per_image_p95': p95,
+        'cnn_backbone': backbone,
     }
     print('[Test Eval]', json.dumps(result, ensure_ascii=False, indent=2))
     out_json = os.path.join('models', 'eval_test.json')
@@ -169,6 +192,9 @@ def evaluate_test_set_from_lists(image_paths, labels, model_path: str, char_to_i
     return result
 
 
+# -------------------------
+# 메인: 데이터 분할/학습/평가
+# -------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_dir', type=str, default='data/generated_dataset')
@@ -183,24 +209,30 @@ def main():
     parser.add_argument('--resume', type=str, default='')
     parser.add_argument('--early_stopping_patience', type=int, default=12)
 
-    # 추가 옵션
-    # 기본 6:2:2 비율
+    # 분할 비율
     parser.add_argument('--train_ratio', type=float, default=0.6)
     parser.add_argument('--val_ratio', type=float, default=0.2)
     parser.add_argument('--test_ratio', type=float, default=0.2)
     parser.add_argument('--shuffle_seed', type=int, default=42)
     parser.add_argument('--overfit_n', type=int, default=0)
-    # 타겟/제너럴 비율 제어(가중 샘플링)
+
+    # 타겟/제너럴 비율 제어
     parser.add_argument('--word_list_path', type=str, default='data/word_list.txt')
     parser.add_argument('--target_start_line', type=int, default=293, help='word_list.txt에서 타겟 시작 라인(1-base)')
     parser.add_argument('--target_end_line', type=int, default=302, help='word_list.txt에서 타겟 종료 라인(포함)')
-    parser.add_argument('--target_ratio', type=float, default=0.4, help='(가중 샘플링용, 유지) 배치 기대 타겟 비율')
-    # 고정 비율 두-스트림 배치 샘플러 옵션
+    parser.add_argument('--target_ratio', type=float, default=0.4, help='(가중 샘플링용) 배치 기대 타겟 비율')
+
+    # 두-스트림 고정 비율 배치 샘플러
     parser.add_argument('--use_fixed_ratio_batch', action='store_true', help='두-스트림 고정 비율 배치 샘플러 사용')
     parser.add_argument('--target_ratio_start', type=float, default=0.3, help='비율 커리큘럼 시작값')
     parser.add_argument('--target_ratio_end', type=float, default=0.4, help='비율 커리큘럼 종료값')
     parser.add_argument('--ratio_warmup_epochs', type=int, default=10, help='비율을 선형 증가시킬 에폭 수')
     parser.add_argument('--target_repeat_max', type=int, default=6, help='한 에폭 내 타겟 샘플 최대 반복 횟수 R_max')
+
+    # 모델 옵션
+    parser.add_argument('--cnn_backbone', type=str, default='basic')  # 'basic' or 'resnet18' 등
+    parser.add_argument('--use_pretrained_backbone', action='store_true')
+
     args = parser.parse_args()
 
     csv_path = os.path.join(args.dataset_dir, 'labels.csv')
@@ -246,7 +278,6 @@ def main():
         target_label_set = set()
 
     # ===== 가중 샘플링용 weight 벡터 계산 (train 전용)
-    # 목표: sum_t(wt) / (sum_t(wt) + sum_g(wg)) ~= target_ratio
     t = sum(1 for lb in tr_labels if lb in target_label_set)
     g = len(tr_labels) - t
     if t > 0 and g > 0:
@@ -257,6 +288,12 @@ def main():
     else:
         sampler_weights = None
 
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    print(f'Train/Val/Test sizes -> train: {len(tr_images)}, val: {len(val_images)}, test: {len(te_images)}')
+
+    # ===== 학습 실행 (train.py 라이브러리 함수 호출)
     train_args = SimpleNamespace(
         train_image_paths=tr_images,
         train_labels=tr_labels,
@@ -281,15 +318,18 @@ def main():
         target_ratio_end=args.target_ratio_end,
         ratio_warmup_epochs=args.ratio_warmup_epochs,
         target_repeat_max=args.target_repeat_max,
+        # 모델 옵션
+        cnn_backbone=args.cnn_backbone,
+        use_pretrained_backbone=args.use_pretrained_backbone,
+        # 기타
+        seed=1234,
+        weight_decay=5e-3,
+        warmup_epochs=3,
+        resume=args.resume if args.resume else None,
     )
-
-    os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
-
-    print(f'Train/Val/Test sizes -> train: {len(tr_images)}, val: {len(val_images)}, test: {len(te_images)}')
     train_fn(train_args)
 
-    # 학습 종료 후 Test 세트 자동 평가
+    # ===== 학습 종료 후 Test 세트 자동 평가
     best_model_path = os.path.join(args.save_dir, 'best_model_by_cer.pth')
     last_model_path = os.path.join(args.save_dir, 'last.pth')
     model_path = best_model_path if os.path.exists(best_model_path) else last_model_path
